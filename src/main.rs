@@ -151,6 +151,7 @@ async fn convert(mut multipart: Multipart) -> Response {
 
     // Convert
     info!("Converting file: {:?}", file_path);
+    let start_time = std::time::Instant::now();
 
     // UserInstallation is set to a temp dir to avoid conflicts and permission issues
     let user_installation = format!("-env:UserInstallation=file://{}/user", work_dir.display());
@@ -174,6 +175,8 @@ async fn convert(mut multipart: Multipart) -> Response {
 
     match output {
         Ok(out) => {
+            let duration = start_time.elapsed();
+            info!("Conversion finished in {:?}", duration);
             if !out.status.success() {
                 error!("LibreOffice failed: stderr: {}", String::from_utf8_lossy(&out.stderr));
                 let _ = fs::remove_dir_all(&work_dir).await;
