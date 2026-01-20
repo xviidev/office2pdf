@@ -1,0 +1,60 @@
+openapi: 3.0.3
+info:
+  title: Office to PDF Converter
+  description: API for converting Office documents to PDF using LibreOffice.
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000
+    description: Local server
+paths:
+  /health:
+    get:
+      summary: Health check
+      description: Returns the health status of the service.
+      responses:
+        '200':
+          description: Service is healthy
+    head:
+      summary: Health check (HEAD)
+      description: Checks if the service is up.
+      responses:
+        '200':
+          description: Service is healthy
+  /convert:
+    post:
+      summary: Convert document to PDF
+      description: Uploads an Office document and converts it to PDF.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The office document to convert (docx, xlsx, pptx, etc.)
+              required:
+                - file
+      responses:
+        '200':
+          description: PDF file generated successfully
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Bad request (e.g., no file uploaded)
+        '401':
+          description: Unauthorized (invalid or missing API Key)
+        '500':
+          description: Internal server error (conversion failed)
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key

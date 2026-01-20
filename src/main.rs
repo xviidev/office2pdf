@@ -1,58 +1,71 @@
 use axum::{
-    extract::{DefaultBodyLimit, Multipart},
+    extract::{DefaultBodyLimit, Multipart, Request},
     http::{header, StatusCode},
-    response::{Html, IntoResponse, Response},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
+use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::fs;
 use tokio::process::Command;
 use tracing::{error, info};
 use uuid::Uuid;
 
+#[derive(Clone)]
+struct AppState {
+    api_key: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let api_key = env::var("API_KEY").ok();
+    if api_key.is_some() {
+        info!("API Key authentication enabled");
+    } else {
+        info!("No API Key set, authentication disabled");
+    }
+
+    let state = Arc::new(AppState { api_key });
+
     let app = Router::new()
-        .route("/", get(index))
         .route("/convert", post(convert))
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)); // 10MB limit
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .route("/health", get(health).head(health))
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10MB limit
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     info!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn index() -> Html<&'static str> {
-    Html(r#"
-    <!doctype html>
-    <html>
-        <head>
-            <title>Office to PDF Converter</title>
-            <style>
-                body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 2rem; }
-                .container { border: 1px solid #ccc; padding: 2rem; border-radius: 4px; }
-            </style>
-        </head>
-        <body>
-            <h1>Convert Office Document to PDF</h1>
-            <div class="container">
-                <form action="/convert" method="post" enctype="multipart/form-data">
-                    <p>
-                        <label>Select file (docx, xlsx, pptx, etc):</label>
-                        <input type="file" name="file" required>
-                    </p>
-                    <p>
-                        <button type="submit">Convert to PDF</button>
-                    </p>
-                </form>
-            </div>
-        </body>
-    </html>
-    "#)
+async fn health() -> StatusCode {
+    StatusCode::OK
 }
+
+async fn auth_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(ref key) = state.api_key {
+        if let Some(auth_header) = req.headers().get("X-Api-Key") {
+            if let Ok(value) = auth_header.to_str() {
+                if value == key {
+                    return next.run(req).await;
+                }
+            }
+        }
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+    next.run(req).await
+}
+
 
 fn sanitize_filename(raw: &str) -> String {
     std::path::Path::new(raw)
@@ -175,9 +188,11 @@ async fn convert(mut multipart: Multipart) -> Response {
     let _ = fs::remove_dir_all(&work_dir).await;
 
     // Return
+    // Escape double quotes in filename to prevent header injection
+    let escaped_filename = pdf_filename_output.replace('"', "\\\"");
     let headers = [
         (header::CONTENT_TYPE, "application/pdf"),
-        (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}\"", pdf_filename_output)),
+        (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}\"", escaped_filename)),
     ];
 
     (headers, pdf_content).into_response()

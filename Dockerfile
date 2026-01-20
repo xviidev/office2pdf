@@ -4,6 +4,10 @@ COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim
+
+# Create a non-root user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
 # Install LibreOffice and dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-core \
@@ -20,7 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY --from=builder /app/target/release/app /app/server
-RUN mkdir -p /tmp/convert
+RUN mkdir -p /tmp/convert && chown -R appuser:appuser /tmp/convert
+
+USER appuser
 
 ENV RUST_LOG=info
 EXPOSE 3000
