@@ -10,6 +10,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -87,7 +88,7 @@ async fn convert(mut multipart: Multipart) -> Response {
     // Process the upload
     let mut file_path = PathBuf::new();
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Ok(Some(mut field)) = multipart.next_field().await {
         if field.name() == Some("file") {
             let raw_filename = field.file_name().unwrap_or("document").to_string();
             let filename = sanitize_filename(&raw_filename);
@@ -95,17 +96,41 @@ async fn convert(mut multipart: Multipart) -> Response {
             file_path = work_dir.join(&filename);
 
             // Stream to file
-            let data = match field.bytes().await {
-                Ok(data) => data,
+            let mut file = match fs::File::create(&file_path).await {
+                Ok(f) => f,
                 Err(e) => {
-                     error!("Failed to read field: {}", e);
-                     let _ = fs::remove_dir_all(&work_dir).await;
-                     return (StatusCode::BAD_REQUEST, "Bad Request").into_response();
+                    error!("Failed to create file: {}", e);
+                    let _ = fs::remove_dir_all(&work_dir).await;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error").into_response();
                 }
             };
 
-            if let Err(e) = fs::write(&file_path, data).await {
-                 error!("Failed to write file: {}", e);
+            let mut success = true;
+            loop {
+                match field.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if let Err(e) = file.write_all(&chunk).await {
+                            error!("Failed to write chunk: {}", e);
+                            success = false;
+                            break;
+                        }
+                    }
+                    Ok(None) => break, // End of stream
+                    Err(e) => {
+                        error!("Failed to read chunk: {}", e);
+                        success = false;
+                        break;
+                    }
+                }
+            }
+
+            if !success {
+                let _ = fs::remove_dir_all(&work_dir).await;
+                return (StatusCode::BAD_REQUEST, "Stream interrupted").into_response();
+            }
+
+            if let Err(e) = file.flush().await {
+                 error!("Failed to flush file: {}", e);
                  let _ = fs::remove_dir_all(&work_dir).await;
                  return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error").into_response();
             }
@@ -124,8 +149,14 @@ async fn convert(mut multipart: Multipart) -> Response {
     // UserInstallation is set to a temp dir to avoid conflicts and permission issues
     let user_installation = format!("-env:UserInstallation=file://{}/user", work_dir.display());
 
+    // Optimized flags for faster startup
     let output = Command::new("libreoffice")
         .arg("--headless")
+        .arg("--nodefault")
+        .arg("--nofirststartwizard")
+        .arg("--nolockcheck")
+        .arg("--nologo")
+        .arg("--norestore")
         .arg("--convert-to")
         .arg("pdf")
         .arg("--outdir")
