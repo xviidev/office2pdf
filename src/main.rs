@@ -2,7 +2,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Request},
     http::{header, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -34,6 +34,7 @@ async fn main() {
     let state = Arc::new(AppState { api_key });
 
     let app = Router::new()
+        .route("/", get(index))
         .route("/convert", post(convert))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .route("/health", get(health).head(health))
@@ -47,6 +48,10 @@ async fn main() {
 
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+async fn index() -> Html<&'static str> {
+    Html(include_str!("index.html"))
 }
 
 async fn auth_middleware(

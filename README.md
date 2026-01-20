@@ -32,6 +32,15 @@ A robust, container-ready API service written in Rust that converts Office docum
 
 ### Running with Docker
 
+You can pull the pre-built image from GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/xviidev/office2pdf:latest
+docker run -p 3000:3000 ghcr.io/xviidev/office2pdf:latest
+```
+
+Or build it locally:
+
 1.  **Build the image**:
     ```bash
     docker build -t office-pdf-converter .
