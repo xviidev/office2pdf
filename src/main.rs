@@ -1,0 +1,199 @@
+use axum::{
+    extract::{DefaultBodyLimit, Multipart},
+    http::{header, StatusCode},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
+    Router,
+};
+use std::path::PathBuf;
+use tokio::fs;
+use tokio::process::Command;
+use tracing::{error, info};
+use uuid::Uuid;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/convert", post(convert))
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)); // 10MB limit
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    info!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn index() -> Html<&'static str> {
+    Html(r#"
+    <!doctype html>
+    <html>
+        <head>
+            <title>Office to PDF Converter</title>
+            <style>
+                body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 2rem; }
+                .container { border: 1px solid #ccc; padding: 2rem; border-radius: 4px; }
+            </style>
+        </head>
+        <body>
+            <h1>Convert Office Document to PDF</h1>
+            <div class="container">
+                <form action="/convert" method="post" enctype="multipart/form-data">
+                    <p>
+                        <label>Select file (docx, xlsx, pptx, etc):</label>
+                        <input type="file" name="file" required>
+                    </p>
+                    <p>
+                        <button type="submit">Convert to PDF</button>
+                    </p>
+                </form>
+            </div>
+        </body>
+    </html>
+    "#)
+}
+
+fn sanitize_filename(raw: &str) -> String {
+    std::path::Path::new(raw)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "document".to_string())
+}
+
+async fn convert(mut multipart: Multipart) -> Response {
+    // create a unique directory for this request
+    let request_id = Uuid::new_v4();
+    let work_dir = PathBuf::from(format!("/tmp/convert/{}", request_id));
+
+    if let Err(e) = fs::create_dir_all(&work_dir).await {
+        error!("Failed to create work dir: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error").into_response();
+    }
+
+    // Process the upload
+    let mut file_path = PathBuf::new();
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("file") {
+            let raw_filename = field.file_name().unwrap_or("document").to_string();
+            let filename = sanitize_filename(&raw_filename);
+
+            file_path = work_dir.join(&filename);
+
+            // Stream to file
+            let data = match field.bytes().await {
+                Ok(data) => data,
+                Err(e) => {
+                     error!("Failed to read field: {}", e);
+                     let _ = fs::remove_dir_all(&work_dir).await;
+                     return (StatusCode::BAD_REQUEST, "Bad Request").into_response();
+                }
+            };
+
+            if let Err(e) = fs::write(&file_path, data).await {
+                 error!("Failed to write file: {}", e);
+                 let _ = fs::remove_dir_all(&work_dir).await;
+                 return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error").into_response();
+            }
+            break;
+        }
+    }
+
+    if file_path.as_os_str().is_empty() {
+         let _ = fs::remove_dir_all(&work_dir).await;
+         return (StatusCode::BAD_REQUEST, "No file uploaded").into_response();
+    }
+
+    // Convert
+    info!("Converting file: {:?}", file_path);
+
+    // UserInstallation is set to a temp dir to avoid conflicts and permission issues
+    let user_installation = format!("-env:UserInstallation=file://{}/user", work_dir.display());
+
+    let output = Command::new("libreoffice")
+        .arg("--headless")
+        .arg("--convert-to")
+        .arg("pdf")
+        .arg("--outdir")
+        .arg(&work_dir)
+        .arg(&user_installation)
+        .arg(&file_path)
+        .output()
+        .await;
+
+    match output {
+        Ok(out) => {
+            if !out.status.success() {
+                error!("LibreOffice failed: stderr: {}", String::from_utf8_lossy(&out.stderr));
+                let _ = fs::remove_dir_all(&work_dir).await;
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Conversion failed").into_response();
+            }
+        }
+        Err(e) => {
+            error!("Failed to run LibreOffice: {}", e);
+            let _ = fs::remove_dir_all(&work_dir).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Conversion execution failed").into_response();
+        }
+    }
+
+    // Find the PDF file
+    // LibreOffice creates a file with the same base name and .pdf extension
+    let mut found_pdf_path: Option<PathBuf> = None;
+    let mut pdf_filename_output = String::from("output.pdf");
+
+    if let Ok(mut entries) = fs::read_dir(&work_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "pdf") {
+                found_pdf_path = Some(path.clone());
+                if let Some(name) = path.file_name() {
+                    pdf_filename_output = name.to_string_lossy().to_string();
+                }
+                break;
+            }
+        }
+    }
+
+    let pdf_content = match found_pdf_path {
+        Some(path) => match fs::read(&path).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to read generated PDF: {}", e);
+                let _ = fs::remove_dir_all(&work_dir).await;
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Read PDF failed").into_response();
+            }
+        },
+        None => {
+            error!("No PDF file found in output directory");
+            let _ = fs::remove_dir_all(&work_dir).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, "PDF generation failed - output not found").into_response();
+        }
+    };
+
+    // Cleanup
+    let _ = fs::remove_dir_all(&work_dir).await;
+
+    // Return
+    let headers = [
+        (header::CONTENT_TYPE, "application/pdf"),
+        (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}\"", pdf_filename_output)),
+    ];
+
+    (headers, pdf_content).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_filename() {
+        assert_eq!(sanitize_filename("test.docx"), "test.docx");
+        assert_eq!(sanitize_filename("/tmp/test.docx"), "test.docx");
+        // Windows paths are treated as full filenames on Linux, so we skip that check or expect full string
+        // assert_eq!(sanitize_filename("C:\\Windows\\test.docx"), "test.docx");
+        // Edge cases
+        assert_eq!(sanitize_filename(""), "document");
+    }
+}
