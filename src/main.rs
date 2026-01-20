@@ -34,9 +34,10 @@ async fn main() {
     let state = Arc::new(AppState { api_key });
 
     let app = Router::new()
-        .route("/", get(index))
         .route("/convert", post(convert))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .route("/", get(index))
+        .route("/ui/convert", post(convert))
         .route("/health", get(health).head(health))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10MB limit
         .with_state(state);

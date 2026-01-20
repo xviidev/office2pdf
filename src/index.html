@@ -318,7 +318,7 @@
                 // For a public UI, we usually assume no auth or we'd need a way to input it.
                 // Given the requirement "make ui", we assume it's for public use or the user knows what they're doing.
 
-                const response = await fetch('/convert', {
+                const response = await fetch('/ui/convert', {
                     method: 'POST',
                     body: formData
                 });
